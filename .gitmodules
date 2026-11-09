@@ -37,23 +37,3 @@
 	path = prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu
 	url = https://github.com/armsom/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu.git
 	branch = main
-
-[submodule "ubuntu22.04"]
-	path = ubuntu22.04
-	url = https://github.com/armsom/ubuntu22.04.git
-	branch = main
-
-[submodule "debian11"]
-	path = debian11
-	url = https://github.com/armsom/debian11.git
-	branch = main
-
-[submodule "debian12"]
-	path = debian12
-	url = https://github.com/armsom/debian12.git
-	branch = main
-
-[submodule "kernel-5.10"]
-	path = kernel-5.10
-	url = https://github.com/armsom/rockchip-kernel5.10.git
-	branch = main
