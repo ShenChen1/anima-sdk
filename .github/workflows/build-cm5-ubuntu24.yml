@@ -73,6 +73,9 @@ jobs:
         run: |
           ./build.sh armsom_cm5_rk3576_ubuntu24_server_defconfig
 
+      - name: Build kernel Debian packages
+        run: ./build.sh kerneldeb
+
       - name: Build full firmware
         run: |
           ./build.sh
