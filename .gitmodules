@@ -1,16 +1,16 @@
 [submodule "device/rockchip"]
 	path = device/rockchip
-	url = https://github.com/ShenChen1/device_rockchip.git
+	url = https://github.com/ShenChen1/rockchip-device.git
 	branch = main
 
 [submodule "u-boot"]
 	path = u-boot
-	url = https://github.com/ShenChen1/u-boot.git
+	url = https://github.com/ShenChen1/rockchip-uboot.git
 	branch = main
 
 [submodule "ubuntu24.04"]
 	path = ubuntu24.04
-	url = https://github.com/ShenChen1/ubuntu24.04.git
+	url = https://github.com/ShenChen1/rockchip-ubuntu24.04.git
 	branch = main
 
 [submodule "kernel-6.1"]
