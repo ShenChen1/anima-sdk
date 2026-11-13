@@ -1,0 +1,164 @@
+name: Build ANIMA Ubuntu 24.04 Server Firmware
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: 'Perform clean build before configuring'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ANIMA RK3576 Ubuntu 24.04 Server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Maximize build disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo docker image prune --all --force 2>/dev/null || true
+          echo "=== Disk space after cleanup ==="
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates git git-lfs wget rsync pigz \
+            build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            bison flex libssl-dev libncurses-dev bc libelf-dev \
+            libmpc-dev libgmp-dev lz4 python3-lz4 fakeroot dpkg-dev \
+            u-boot-tools device-tree-compiler python3 python3-pyelftools \
+            python3-setuptools python3-pip python-is-python3 kmod cpio \
+            dosfstools mtools fdisk parted e2fsprogs openssl \
+            qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-aarch64 || true
+          test -x /usr/bin/qemu-aarch64-static
+          test -r /proc/sys/fs/binfmt_misc/qemu-aarch64
+
+      - name: Checkout anima-sdk
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Sync submodules and LFS assets
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1
+          git -C ubuntu24.04 lfs install --local
+          git -C ubuntu24.04 lfs pull
+          missing_lfs="$(git -C ubuntu24.04 lfs ls-files | awk '$2 == "-"')"
+          if [ -n "$missing_lfs" ]; then
+            echo "ERROR: Unpulled Git LFS objects in ubuntu24.04:" >&2
+            echo "$missing_lfs" >&2
+            exit 1
+          fi
+          ls -lh ubuntu24.04/packages/arm64/libmali/
+
+      - name: Configure board defconfig
+        env:
+          CLEAN_BUILD: ${{ inputs.clean_build }}
+        run: |
+          if [ "${CLEAN_BUILD:-false}" = "true" ]; then
+            ./build.sh cleanall || true
+          fi
+          ./build.sh armsom_cm5_rk3576_ubuntu24_server_defconfig
+
+      - name: Build kernel Debian packages
+        run: ./build.sh kerneldeb
+
+      - name: Build full firmware
+        run: ./build.sh
+
+      - name: Package firmware artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-output
+          DATE_TAG="$(date +%Y%m%d_%H%M%S)"
+          PREFIX="anima-rk3576-ubuntu24.04-server"
+          FIRMWARE_DIR="$(readlink -f rockdev)"
+          if [ ! -d "$FIRMWARE_DIR" ]; then
+            echo "ERROR: Firmware directory not found: $FIRMWARE_DIR" >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          echo "=== 1. Collecting A/B update image ==="
+          gz_files=("$FIRMWARE_DIR"/${PREFIX}-*.img.gz)
+          if [ "${#gz_files[@]}" -gt 0 ]; then
+            SDK_UPDATE_GZ="${gz_files[0]}"
+            for f in "${gz_files[@]}"; do
+              if [ "$f" -nt "$SDK_UPDATE_GZ" ]; then
+                SDK_UPDATE_GZ="$f"
+              fi
+            done
+            UPDATE_BASENAME="$(basename "$SDK_UPDATE_GZ")"
+            cp -vL "$SDK_UPDATE_GZ" "release-output/${UPDATE_BASENAME}"
+          elif [ -r "$FIRMWARE_DIR/update.img" ]; then
+            UPDATE_BASENAME="${PREFIX}-${DATE_TAG}-update-ab.img.gz"
+            pigz -c -9 "$FIRMWARE_DIR/update.img" > "release-output/${UPDATE_BASENAME}"
+          else
+            echo "ERROR: Missing update image in $FIRMWARE_DIR" >&2
+            exit 1
+          fi
+
+          echo "=== 2. Packaging partition images with dereference (-h) ==="
+          PARTITIONS_TAR="${PREFIX}-${DATE_TAG}-all-partitions.tar.gz"
+          tar -chvf - \
+            --exclude='update*.img' \
+            --exclude='*.img.gz' \
+            -C "$FIRMWARE_DIR" . | pigz -p 4 > "release-output/${PARTITIONS_TAR}"
+
+          echo "=== 3. Collecting Linux Kernel deb packages (including debug symbols) ==="
+          deb_files=(linux-image-*.deb linux-headers-*.deb linux-libc-dev*.deb)
+          if [ "${#deb_files[@]}" -gt 0 ]; then
+            cp -v "${deb_files[@]}" release-output/
+          else
+            echo "WARNING: No kernel deb packages found in workspace root" >&2
+          fi
+
+          echo "=== 4. Generating MD5 checksums ==="
+          (
+            cd release-output
+            md5sum "${UPDATE_BASENAME}" > "${UPDATE_BASENAME}.md5"
+            md5sum "${PARTITIONS_TAR}" > "${PARTITIONS_TAR}.md5"
+          )
+
+          echo "=== Release Output Summary ==="
+          ls -lh release-output/
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: anima-rk3576-ubuntu24-server-firmware
+          path: release-output/*
+          retention-days: 7
+
+      - name: Release to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-output/*
+          generate_release_notes: true
