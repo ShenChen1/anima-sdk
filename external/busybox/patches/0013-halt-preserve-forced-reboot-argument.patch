@@ -1,0 +1,47 @@
+Subject: [PATCH] halt: preserve reboot arguments in the forced shutdown path
+
+Keep the existing Rockchip non-forced path. Pass one bounded argument to
+RESTART2 after callers have completed their own filesystem cleanup.
+
+--- a/init/halt.c
++++ b/init/halt.c
+@@ -84,7 +84,7 @@
+ //usage:     "\n	-f	Force (don't go through init)"
+ //usage:
+ //usage:#define reboot_trivial_usage
+-//usage:       "[-d DELAY] [-nf]"
++//usage:       "[-d DELAY] [-nf] [ARG]"
+ //usage:#define reboot_full_usage "\n\n"
+ //usage:       "Reboot the system\n"
+ //usage:     "\n	-d SEC	Delay interval"
+@@ -203,6 +203,21 @@
+ 	return syscall(__NR_reboot, LINUX_REBOOT_MAGIC1,
+ 			LINUX_REBOOT_MAGIC2,
+ 			LINUX_REBOOT_CMD_RESTART2, arg);
++}
++
++static int forced_reboot(int which, int magic, char **args)
++{
++	enum { REBOOT_ARGUMENT_MAX = 255 };
++
++	if (!args[0])
++		return reboot(magic);
++	if (which != 2 || args[1] || !args[0][0]
++	 || strlen(args[0]) > REBOOT_ARGUMENT_MAX)
++		bb_show_usage();
++
++	/* The caller has already finalized storage; do not fork or sync again. */
++	return syscall(__NR_reboot, LINUX_REBOOT_MAGIC1,
++			LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, args[0]);
+ }
+ 
+ int halt_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+@@ -289,7 +304,7 @@
+ 			rc = reboot_with_arg(argv[1]);
+ 
+ 	} else {
+-		rc = reboot(magic[which]);
++		rc = forced_reboot(which, magic[which], argv + optind);
+ 	}
+ 
+ 	if (rc)
