@@ -1,52 +1,40 @@
-# Repository Guidelines
+# ANIMA RK3576 SDK 开发指南
 
-## 项目结构与模块组织
+## 仓库边界
 
-本目录是由 Repo 管理的 ArmSoM/Rockchip Linux SDK，根目录本身不是 Git 仓库；在对应子仓库内检查和提交修改。
+这是面向 ArmSoM CM5（RK3576）的 Linux SDK。根目录是 Git 主仓库，负责 CI、入口链接、`.gitmodules` 和九个子模块的提交指针。按根仓库记录的提交复现构建；`.gitmodules` 中的分支名不代表当前构建使用该分支的最新版本。
 
-- `device/rockchip/common/`：构建脚本、钩子与公共配置；根目录 `build.sh`、`Makefile`、`README.md` 链接至此。
-- `device/rockchip/.chips/rk3576/`：板级 defconfig、分区表与打包配置。
-- `kernel-6.1/`、`kernel-5.10/`：内核、驱动与设备树；`kernel/` 是可切换的链接。
-- `u-boot/`：引导程序；`rkbin/`、`armsom-initrd/`：固件二进制与初始内存盘；`prebuilts/`、`tools/`：工具链和工具。
-- `debian11/`、`debian12/`、`ubuntu22.04/`、`ubuntu24.04/`：根文件系统构建、覆盖文件与调试资源。
-- `output/`：生成配置、日志和镜像；`rockdev/` 链接到 `output/firmware/`。
+| 修改对象 | 源码位置 |
+| --- | --- |
+| CI、发布产物 | `.github/workflows/build-anima-ubuntu24.yml` |
+| 构建目标、配置和钩子 | `device/rockchip/common/`。根目录的 `build.sh`、`Makefile`、`README.md`、`rkflash.sh` 均为链接 |
+| CM5 板级配置、分区表、打包清单 | `device/rockchip/.chips/rk3576/` |
+| 内核、驱动、设备树 | `kernel-6.1/`，根目录 `kernel` 指向此处 |
+| 引导程序与固件 | `u-boot/`、`rkbin/`、`armsom-initrd/` |
+| Ubuntu 用户空间、软件包和镜像构建 | `ubuntu24.04/`，板上文件主要来自 `overlay/` 和 `overlay-anima/`，制镜入口包括 `mk-base-ubuntu.sh`、`mk-ubuntu-rootfs.sh` 和 `mk-image.sh` |
+| Rockchip 升级工具源码 | `external/recovery/update_engine/` |
+| SDK 工具与交叉编译器 | `tools/`、`prebuilts/gcc/linux-x86/aarch64/` 下的 GCC 子模块 |
 
-## 构建与开发命令
+审查改动时先看根仓库，再检查相关子模块的暂存、未暂存和未跟踪文件。用 `git submodule status --recursive` 核对版本，用 `git -C <子模块> status --short` 查看内部改动。跨仓库交付时先提交子模块内容，再在主仓库更新对应指针；保留其他工作区改动。
 
-在 SDK 根目录使用 Bash。先确认开发板、根文件系统和内核版本；不要直接套用 README 中其他芯片的示例。
+## 构建 ANIMA Ubuntu 24.04 Server
+
+从 SDK 根目录使用 Bash。CI 主机为 Ubuntu 24.04。完整依赖及 QEMU binfmt 检查见上述 workflow；构建 arm64 rootfs 需要能运行目标架构的 chroot。新克隆按以下顺序准备和构建：
 
 ```bash
-./build.sh chip       # 交互选择芯片和板级配置
-./build.sh uboot      # 构建引导程序
-./build.sh kernel     # 构建内核及配置要求的启动镜像、deb 包
-./build.sh ubuntu     # 构建 Ubuntu 根文件系统；Debian 使用 debian
-./build.sh firmware   # 整理分区镜像
-./build.sh updateimg  # 打包 update.img
+git submodule update --init --recursive
+git -C ubuntu24.04 lfs install --local
+git -C ubuntu24.04 lfs pull
+./build.sh armsom_cm5_rk3576_ubuntu24_server_defconfig
+./build.sh kerneldeb
+./build.sh
 ```
 
-`./build.sh` 执行默认完整镜像构建；`./build.sh help` 查看可用目标。日志位于 `output/sessions/`。板级配置必须匹配硬件，例如 `armsom_cm5_rk3576_ubuntu_server_defconfig` 适用于 CM5 对应配置。
+选用文件名含 `ubuntu24` 的 CM5 server defconfig。它选择 Noble、server、release。先运行 `kerneldeb`，因为 Ubuntu 制镜脚本按内核 release、Debian 包版本和架构选择配套的 headers 与 image 包。`./build.sh help` 列出目标；已配置的工作区可按范围运行 `uboot`、`kernel`、`ubuntu`、`firmware` 或 `updateimg`。
 
-## 编码风格与命名
+## 当前板型的启动和存储
 
-遵循所属子项目及相邻代码风格；内核 C、设备树和公共构建脚本使用现有制表符缩进，Makefile 配方必须使用制表符。保留 `RK_*` 配置命名、`*_defconfig` 板级命名及 `<priority>-<hook>.sh` 钩子命名。内核提供 `.clang-format` 和 `scripts/checkpatch.pl`，避免整文件格式化造成无关差异。
-
-## 测试与验证
-
-内核包含 KUnit 和 `tools/testing/selftests/`；按修改范围选择测试，本 SDK 没有统一的根目录测试命令或覆盖率门槛。
-
-- Shell 修改先运行 `bash -n <script.sh>`，并验证正常输入与错误输入。
-- 内核补丁可运行 `kernel/scripts/checkpatch.pl --no-tree <patch>`，再使用目标板配置编译。
-- 新功能添加针对性测试；修复缺陷先添加能复现问题的回归测试。
-- 板上外设测试入口如 `ubuntu22.04/overlay-debug/rockchip-test/rockchip_test.sh`；将相应测试资源部署到目标板后运行，按模块选择测试。
-
-记录板型、defconfig、内核版本、命令和结果，分别说明编译验证与真实硬件验证。
-
-## 提交与 Pull Request
-
-当前清单使用浅克隆，可见历史包含 `add armsom-sige7s`、`fix: del waveshare_backlight` 等标题，未形成统一前缀规范。使用简短、明确的英文标题；每次提交只处理一个问题，并在对应子仓库操作。
-
-PR 说明问题、行为变化、关联 Issue、假设、受影响板型及验证结果；界面变化附截图，启动或驱动变化附相关日志。修改前完整阅读相关文件、定义和调用路径，比较至少两种方案后选择最简单的可行方案。
-
-## 配置与产物管理
-
-持久配置修改应落在受版本控制的 defconfig 或覆盖文件中。不要提交 `output/`、生成的镜像、deb 包或环境快照；分享日志前移除凭据和密钥。
+- U-Boot 使用 `u-boot/configs/rk3576-fit-ab.config`。排查启动看门狗时，从 `u-boot/include/configs/evb_rk3576.h` 的启动命令跟到内核 WDT 驱动及用户空间接管逻辑。
+- 内核使用 `armsom_linux_rk3576_defconfig` 并叠加 `rk3576_anima.config`，两者均在 `kernel-6.1/arch/arm64/configs/`。目标 DTS 是 `arch/arm64/boot/dts/rockchip/rk3576-armsom-cm5-io-f050008m01.dts`（相对于内核根目录）。板级配置选择 FIT、eMMC A/B 和空白 misc 镜像，关闭 extboot 和独立 recovery 镜像。
+- 改动分区时同时核对板级 defconfig、`parameter-ab-minimal.txt` 和自定义整包清单 `package-file-ab-minimal`。整包将同一份 `boot.img` 写入两个 boot 槽，将 `rootfs.img` 写入两个 system 槽，另带 `overlay.img` 和 `data.img`。overlay 分区为 4 GiB，data 使用剩余空间；两个 ext4 初始镜像各为 128 MiB，容量与初始镜像大小要分别核对。
+- Ubuntu 的 `overlay-anima/usr/sbin/anima-init` 在 systemd 前建立只读系统槽和 OverlayFS 根，持久化清单位于 `overlay-anima/etc/anima/persistent.conf`，关机卸载由 `overlay-anima/usr/sbin/anima-shutdown` 接管。共享分区挂到 `/overlay`，data 挂到 `/opt`。修改持久化时同时检查制镜、启动和关机路径，区分每次启动清空的可写层与跨槽保留的数据。
