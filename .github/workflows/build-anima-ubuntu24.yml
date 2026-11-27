@@ -8,41 +8,119 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: 'Optional tag to publish to GitHub Releases (e.g. v1.0; leave empty to skip release)'
+        required: false
+        default: ''
+        type: string
       clean_build:
         description: 'Perform clean build before configuring'
         required: false
-        default: 'false'
+        default: false
         type: boolean
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.release_tag || 'default' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.release_tag }}
 
 permissions:
   contents: write
+
+env:
+  ARTIFACT_PREFIX: anima-rk3576-ubuntu24.04-server
+  BOARD_DEFCONFIG: armsom_cm5_rk3576_ubuntu24_server_defconfig
+  RELEASE_OUTPUT_DIR: release-output
+  RELEASE_NOTES_FILE: release-notes.md
+  GITHUB_RELEASE_ASSET_LIMIT_BYTES: '2147483648'
 
 jobs:
   build:
     name: Build ANIMA RK3576 Ubuntu 24.04 Server
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
 
     steps:
+      - name: Resolve build metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_STR: ${{ github.ref }}
+          GITHUB_REF_NAME_STR: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          validate_tag() {
+            local tag="$1"
+            if [[ ! "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || \
+               [[ "$tag" == *..* ]] || [[ "$tag" == *. ]]; then
+              echo "ERROR: Invalid release tag '$tag'. Allowed: [A-Za-z0-9._-], no '..', no trailing '.'." >&2
+              exit 1
+            fi
+          }
+
+          SHOULD_RELEASE="false"
+          RELEASE_TAG=""
+
+          if [ "$EVENT_NAME" = "push" ] && [[ "$GITHUB_REF_STR" == refs/tags/v* ]]; then
+            validate_tag "$GITHUB_REF_NAME_STR"
+            RELEASE_TAG="$GITHUB_REF_NAME_STR"
+            SHOULD_RELEASE="true"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            trimmed_tag="${INPUT_RELEASE_TAG#"${INPUT_RELEASE_TAG%%[![:space:]]*}"}"
+            trimmed_tag="${trimmed_tag%"${trimmed_tag##*[![:space:]]}"}"
+            if [ -n "$trimmed_tag" ]; then
+              validate_tag "$trimmed_tag"
+              RELEASE_TAG="$trimmed_tag"
+              SHOULD_RELEASE="true"
+            fi
+          fi
+
+          if [ "$SHOULD_RELEASE" = "true" ]; then
+            VERSION_TAG="$RELEASE_TAG"
+          else
+            VERSION_TAG="$(date -u +%Y%m%d_%H%M%S)-${COMMIT_SHA:0:7}"
+          fi
+
+          IS_PRERELEASE="false"
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            IS_PRERELEASE="true"
+          fi
+
+          {
+            echo "should_release=${SHOULD_RELEASE}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "version_tag=${VERSION_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "should_release=${SHOULD_RELEASE}"
+          echo "release_tag=${RELEASE_TAG:-<none>}"
+          echo "is_prerelease=${IS_PRERELEASE}"
+          echo "version_tag=${VERSION_TAG}"
+
       - name: Maximize build disk space
         run: |
+          set -euo pipefail
           echo "=== Disk space before cleanup ==="
           df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
           sudo docker image prune --all --force 2>/dev/null || true
           echo "=== Disk space after cleanup ==="
           df -h
 
       - name: Install build dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ca-certificates git git-lfs wget rsync pigz \
@@ -58,14 +136,14 @@ jobs:
           test -r /proc/sys/fs/binfmt_misc/qemu-aarch64
 
       - name: Checkout anima-sdk
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Sync submodules and LFS assets
         run: |
           set -euo pipefail
-          git submodule update --init --depth 1
+          git submodule update --init --recursive --depth 1
           git -C ubuntu24.04 lfs install --local
           git -C ubuntu24.04 lfs pull
           missing_lfs="$(git -C ubuntu24.04 lfs ls-files | awk '$2 == "-"')"
@@ -80,10 +158,11 @@ jobs:
         env:
           CLEAN_BUILD: ${{ inputs.clean_build }}
         run: |
+          set -euo pipefail
           if [ "${CLEAN_BUILD:-false}" = "true" ]; then
             ./build.sh cleanall || true
           fi
-          ./build.sh armsom_cm5_rk3576_ubuntu24_server_defconfig
+          ./build.sh "$BOARD_DEFCONFIG"
 
       - name: Build kernel Debian packages
         run: ./build.sh kerneldeb
@@ -92,73 +171,181 @@ jobs:
         run: ./build.sh
 
       - name: Package firmware artifacts
-        shell: bash
+        id: package
+        env:
+          VERSION_TAG: ${{ steps.meta.outputs.version_tag }}
         run: |
           set -euo pipefail
-          mkdir -p release-output
-          DATE_TAG="$(date +%Y%m%d_%H%M%S)"
-          PREFIX="anima-rk3576-ubuntu24.04-server"
+          shopt -s nullglob
+
+          rm -rf "$RELEASE_OUTPUT_DIR"
+          mkdir -p "$RELEASE_OUTPUT_DIR"
+
           FIRMWARE_DIR="$(readlink -f rockdev)"
           if [ ! -d "$FIRMWARE_DIR" ]; then
             echo "ERROR: Firmware directory not found: $FIRMWARE_DIR" >&2
             exit 1
           fi
 
-          shopt -s nullglob
-          echo "=== 1. Collecting A/B update image ==="
-          gz_files=("$FIRMWARE_DIR"/${PREFIX}-*.img.gz)
+          UPDATE_ARCHIVE="${ARTIFACT_PREFIX}-${VERSION_TAG}-update.img.gz"
+          PARTITIONS_ARCHIVE="${ARTIFACT_PREFIX}-${VERSION_TAG}-all-partitions.tar.gz"
+          PARTITIONS_DIRNAME="${ARTIFACT_PREFIX}-${VERSION_TAG}-partitions"
+
+          echo "=== 1. Collecting A/B full update firmware ==="
+          gz_files=("$FIRMWARE_DIR"/"${ARTIFACT_PREFIX}"-*.img.gz)
           if [ "${#gz_files[@]}" -gt 0 ]; then
-            SDK_UPDATE_GZ="${gz_files[0]}"
+            sdk_update_gz="${gz_files[0]}"
             for f in "${gz_files[@]}"; do
-              if [ "$f" -nt "$SDK_UPDATE_GZ" ]; then
-                SDK_UPDATE_GZ="$f"
+              if [ "$f" -nt "$sdk_update_gz" ]; then
+                sdk_update_gz="$f"
               fi
             done
-            UPDATE_BASENAME="$(basename "$SDK_UPDATE_GZ")"
-            cp -vL "$SDK_UPDATE_GZ" "release-output/${UPDATE_BASENAME}"
+            cp -vL "$sdk_update_gz" "${RELEASE_OUTPUT_DIR}/${UPDATE_ARCHIVE}"
           elif [ -r "$FIRMWARE_DIR/update.img" ]; then
-            UPDATE_BASENAME="${PREFIX}-${DATE_TAG}-update-ab.img.gz"
-            pigz -c -9 "$FIRMWARE_DIR/update.img" > "release-output/${UPDATE_BASENAME}"
+            pigz -c -9 "$FIRMWARE_DIR/update.img" > "${RELEASE_OUTPUT_DIR}/${UPDATE_ARCHIVE}"
           else
             echo "ERROR: Missing update image in $FIRMWARE_DIR" >&2
             exit 1
           fi
 
-          echo "=== 2. Packaging partition images with dereference (-h) ==="
-          PARTITIONS_TAR="${PREFIX}-${DATE_TAG}-all-partitions.tar.gz"
-          tar -chvf - \
-            --exclude='update*.img' \
-            --exclude='*.img.gz' \
-            -C "$FIRMWARE_DIR" . | pigz -p 4 > "release-output/${PARTITIONS_TAR}"
+          echo "=== 2. Packaging individual partition images ==="
+          stage_dir="$(mktemp -d)"
+          trap 'rm -rf "$stage_dir"' EXIT
+          mkdir -p "${stage_dir}/${PARTITIONS_DIRNAME}"
 
-          echo "=== 3. Collecting Linux Kernel deb packages (including debug symbols) ==="
-          deb_files=(linux-image-*.deb linux-headers-*.deb linux-libc-dev*.deb)
-          if [ "${#deb_files[@]}" -gt 0 ]; then
-            cp -v "${deb_files[@]}" release-output/
-          else
-            echo "WARNING: No kernel deb packages found in workspace root" >&2
+          for item in "$FIRMWARE_DIR"/*; do
+            name="$(basename "$item")"
+            case "$name" in
+              update*.img|*.img.gz) continue ;;
+            esac
+            target="$(readlink -f "$item")"
+            if [ ! -r "$target" ]; then
+              echo "ERROR: Unreadable firmware entry: $item -> $target" >&2
+              exit 1
+            fi
+            ln -s "$target" "${stage_dir}/${PARTITIONS_DIRNAME}/${name}"
+          done
+
+          if [ -r output/update-ab/package-file ]; then
+            ln -s "$(readlink -f output/update-ab/package-file)" \
+              "${stage_dir}/${PARTITIONS_DIRNAME}/package-file"
           fi
 
-          echo "=== 4. Generating MD5 checksums ==="
+          echo "Partition archive entries:"
+          ls -lhL "${stage_dir}/${PARTITIONS_DIRNAME}/"
+          tar -chf - --owner=0 --group=0 -C "$stage_dir" "$PARTITIONS_DIRNAME" \
+            | pigz -p 4 > "${RELEASE_OUTPUT_DIR}/${PARTITIONS_ARCHIVE}"
+
+          echo "=== 3. Collecting Linux kernel Debian packages ==="
+          image_debs=(linux-image-*.deb)
+          header_debs=(linux-headers-*.deb)
+          libc_debs=(linux-libc-dev*.deb)
+          if [ "${#image_debs[@]}" -eq 0 ] || [ "${#header_debs[@]}" -eq 0 ] || [ "${#libc_debs[@]}" -eq 0 ]; then
+            echo "ERROR: Missing expected kernel .deb packages in workspace root" >&2
+            ls -la linux-*.deb 2>/dev/null || true
+            exit 1
+          fi
+          cp -v "${image_debs[@]}" "${header_debs[@]}" "${libc_debs[@]}" "${RELEASE_OUTPUT_DIR}/"
+
+          echo "=== 4. Validating GitHub Release 2 GiB single-asset limit ==="
+          for asset in "${RELEASE_OUTPUT_DIR}"/*; do
+            size_bytes="$(stat -c '%s' "$asset")"
+            if [ "$size_bytes" -ge "$GITHUB_RELEASE_ASSET_LIMIT_BYTES" ]; then
+              echo "ERROR: Asset $(basename "$asset") is ${size_bytes} bytes (>= 2 GiB GitHub Release limit)" >&2
+              exit 1
+            fi
+          done
+
+          echo "=== 5. Generating SHA256SUMS ==="
           (
-            cd release-output
-            md5sum "${UPDATE_BASENAME}" > "${UPDATE_BASENAME}.md5"
-            md5sum "${PARTITIONS_TAR}" > "${PARTITIONS_TAR}.md5"
+            cd "$RELEASE_OUTPUT_DIR"
+            mapfile -t files < <(printf '%s\n' * | LC_ALL=C sort)
+            sha256sum -- "${files[@]}" > SHA256SUMS
           )
 
+          {
+            echo "update_archive=${UPDATE_ARCHIVE}"
+            echo "partitions_archive=${PARTITIONS_ARCHIVE}"
+          } >> "$GITHUB_OUTPUT"
+
           echo "=== Release Output Summary ==="
-          ls -lh release-output/
+          ls -lh "${RELEASE_OUTPUT_DIR}/"
+          cat "${RELEASE_OUTPUT_DIR}/SHA256SUMS"
+
+      - name: Generate release notes and summary
+        env:
+          VERSION_TAG: ${{ steps.meta.outputs.version_tag }}
+          UPDATE_ARCHIVE: ${{ steps.package.outputs.update_archive }}
+          PARTITIONS_ARCHIVE: ${{ steps.package.outputs.partitions_archive }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          describe_asset() {
+            local name="$1"
+            case "$name" in
+              *-update.img.gz) echo "Full A/B update firmware image (gzipped \`update.img\` for RKDevTool / \`upgrade_tool\`)" ;;
+              *-all-partitions.tar.gz) echo "Individual partition images (\`MiniLoaderAll.bin\`, \`parameter.txt\`, \`uboot\`, \`misc\`, \`boot\`, \`rootfs\`, \`overlay\`, \`data\`, \`package-file\`)" ;;
+              linux-image-*-dbg_*.deb) echo "Linux kernel debug symbols package" ;;
+              linux-image-*.deb) echo "Linux kernel image package" ;;
+              linux-headers-*.deb) echo "Linux kernel headers package" ;;
+              linux-libc-dev*.deb) echo "Linux kernel UAPI headers package" ;;
+              SHA256SUMS) echo "SHA-256 checksums for all assets" ;;
+              *) echo "Build artifact" ;;
+            esac
+          }
+
+          {
+            echo "## ANIMA RK3576 Ubuntu 24.04 Server Firmware (\`${VERSION_TAG}\`)"
+            echo ""
+            echo "- **Board**: ArmSoM CM5 (RK3576)"
+            echo "- **Defconfig**: \`${BOARD_DEFCONFIG}\`"
+            echo "- **Commit**: \`${COMMIT_SHA}\`"
+            echo ""
+            echo "### Assets"
+            echo ""
+            echo "| File | Size | Description |"
+            echo "| --- | ---: | --- |"
+            while IFS= read -r filepath; do
+              name="$(basename "$filepath")"
+              size="$(numfmt --to=iec-i --suffix=B "$(stat -c '%s' "$filepath")")"
+              desc="$(describe_asset "$name")"
+              echo "| \`${name}\` | ${size} | ${desc} |"
+            done < <(printf '%s\n' "${RELEASE_OUTPUT_DIR}"/* | LC_ALL=C sort)
+            echo ""
+            echo "### Quick Verify & Extract"
+            echo ""
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS"
+            echo "gunzip -k ${UPDATE_ARCHIVE}"
+            echo "tar -xzf ${PARTITIONS_ARCHIVE}"
+            echo '```'
+          } > "$RELEASE_NOTES_FILE"
+
+          cat "$RELEASE_NOTES_FILE"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            cat "$RELEASE_NOTES_FILE" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: anima-rk3576-ubuntu24-server-firmware
-          path: release-output/*
+          path: ${{ env.RELEASE_OUTPUT_DIR }}/*
+          if-no-files-found: error
+          compression-level: 0
           retention-days: 7
 
-      - name: Release to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v3
         with:
-          files: release-output/*
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
+          body_path: ${{ env.RELEASE_NOTES_FILE }}
           generate_release_notes: true
+          files: ${{ env.RELEASE_OUTPUT_DIR }}/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
